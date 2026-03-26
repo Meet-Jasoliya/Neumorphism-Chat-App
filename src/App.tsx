@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { format } from 'date-fns';
-import { Send, User as UserIcon, Users, LogOut, MessageSquare, ChevronLeft, Check, CheckCheck } from 'lucide-react';
+import { Send, User as UserIcon, Users, LogOut, MessageSquare, ChevronLeft, Check, CheckCheck, Image as ImageIcon, Smile, Reply, X, Sun, Moon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
 import { db, auth, googleProvider } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
-import { ref, set, onValue, push, update, serverTimestamp, query, orderByChild, equalTo, onDisconnect } from 'firebase/database';
+import { ref, set, onValue, push, update, serverTimestamp, query, orderByChild, equalTo, onDisconnect, get } from 'firebase/database';
 
 // Types
 interface Message {
@@ -17,6 +17,12 @@ interface Message {
   text: string;
   timestamp: number;
   status?: 'sent' | 'delivered' | 'read';
+  replyTo?: {
+    id: string;
+    text: string;
+    senderName: string;
+  };
+  reactions?: Record<string, string>;
 }
 
 interface User {
@@ -74,11 +80,15 @@ function MessageStatusIndicator({ status }: { status: 'sent' | 'delivered' | 're
 function ChatInput({ 
   currentUser,
   selectedUser, 
-  onSendMessage 
+  onSendMessage,
+  replyingTo,
+  onCancelReply
 }: { 
   currentUser: User;
   selectedUser: User; 
-  onSendMessage: (text: string) => void;
+  onSendMessage: (text: string, replyTo?: Message | null) => void;
+  replyingTo: Message | null;
+  onCancelReply: () => void;
 }) {
   const [inputText, setInputText] = useState('');
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -86,7 +96,7 @@ function ChatInput({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (inputText.trim()) {
-      onSendMessage(inputText.trim());
+      onSendMessage(inputText.trim(), replyingTo);
       const chatId = [currentUser.id, selectedUser.id].sort().join('_');
       update(ref(db, `chats/${chatId}`), { [`typing_${currentUser.id}`]: false });
       setInputText('');
@@ -112,29 +122,51 @@ function ChatInput({
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex gap-2 md:gap-4">
-      <input
-        type="text"
-        value={inputText}
-        onChange={handleChange}
-        dir="auto"
-        placeholder={`Message ${selectedUser.name}...`}
-        className="flex-1 neu-pressed rounded-2xl px-4 py-3 md:px-6 md:py-4 outline-none text-neu-text placeholder:text-neu-text/50 focus:ring-2 focus:ring-neu-accent/30 transition-all text-sm md:text-base"
-      />
-      <button
-        type="submit"
-        disabled={!inputText.trim()}
-        className="w-12 h-12 md:w-14 md:h-14 shrink-0 neu-flat hover:neu-convex active:neu-pressed rounded-2xl flex items-center justify-center text-neu-accent transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        <Send size={18} className="ml-1 md:w-5 md:h-5" />
-      </button>
-    </form>
+    <div className="flex flex-col gap-2 w-full">
+      <AnimatePresence>
+        {replyingTo && (
+          <motion.div 
+            initial={{ opacity: 0, y: 10, height: 0 }}
+            animate={{ opacity: 1, y: 0, height: 'auto' }}
+            exit={{ opacity: 0, y: 10, height: 0 }}
+            className="flex items-center justify-between px-4 py-2 bg-neu-text/5 rounded-xl text-sm overflow-hidden"
+          >
+            <div className="truncate flex-1 opacity-70 border-l-2 border-neu-accent pl-2">
+              <span className="font-bold">{replyingTo.senderName}:</span> {replyingTo.text}
+            </div>
+            <button type="button" onClick={onCancelReply} className="ml-2 p-1 opacity-50 hover:opacity-100 rounded-full hover:bg-neu-text/10 transition-colors">
+              <X size={16} />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <form onSubmit={handleSubmit} className="flex gap-2 md:gap-4">
+        <input
+          type="text"
+          value={inputText}
+          onChange={handleChange}
+          dir="auto"
+          placeholder={`Message ${selectedUser.name}...`}
+          className="flex-1 neu-pressed rounded-2xl px-4 py-3 md:px-6 md:py-4 outline-none text-neu-text placeholder:text-neu-text/50 focus:ring-2 focus:ring-neu-accent/30 transition-all text-sm md:text-base"
+        />
+        <button
+          type="submit"
+          disabled={!inputText.trim()}
+          className="w-12 h-12 md:w-14 md:h-14 shrink-0 neu-flat hover:neu-convex active:neu-pressed rounded-2xl flex items-center justify-center text-neu-accent transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <Send size={18} className="ml-1 md:w-5 md:h-5" />
+        </button>
+      </form>
+    </div>
   );
 }
 
 export default function App() {
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [isJoined, setIsJoined] = useState(false);
+  const [needsProfileSetup, setNeedsProfileSetup] = useState(false);
+  const [setupName, setSetupName] = useState('');
+  const [setupPhotoURL, setSetupPhotoURL] = useState('');
   const [authErrorDomain, setAuthErrorDomain] = useState<string | null>(null);
   const [guestName, setGuestName] = useState('');
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -142,38 +174,60 @@ export default function App() {
   
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [isMessagesLoading, setIsMessagesLoading] = useState(false);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [isSelectedUserTyping, setIsSelectedUserTyping] = useState(false);
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [activeReactionMsg, setActiveReactionMsg] = useState<string | null>(null);
+  const [isDarkMode, setIsDarkMode] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('theme') === 'dark' || 
+        (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    }
+    return false;
+  });
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (isDarkMode) {
+      document.documentElement.classList.add('dark');
+      localStorage.setItem('theme', 'dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+      localStorage.setItem('theme', 'light');
+    }
+  }, [isDarkMode]);
 
   // Authentication State Listener
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         const userRef = ref(db, `users/${user.uid}`);
+        const snapshot = await get(userRef);
         
-        // Setup disconnect hook so they go offline if they close the tab
-        onDisconnect(userRef).update({ 
-          isOnline: false, 
-          lastSeen: serverTimestamp() 
-        });
+        let existingName = user.displayName || 'User';
+        let existingPhoto = user.photoURL || '';
 
-        // Update user profile in DB
-        await update(userRef, {
-          id: user.uid,
-          name: user.displayName || 'User',
-          photoURL: user.photoURL || '',
-          isOnline: true,
-          lastSeen: serverTimestamp()
-        });
+        if (snapshot.exists()) {
+          const data = snapshot.val();
+          if (data.name) existingName = data.name;
+          if (data.photoURL) existingPhoto = data.photoURL;
+        }
+
+        setSetupName(existingName);
+        setSetupPhotoURL(existingPhoto);
         
         setCurrentUser({ 
           id: user.uid, 
-          name: user.displayName || 'User',
-          photoURL: user.photoURL || ''
+          name: existingName,
+          photoURL: existingPhoto
         });
-        setIsJoined(true);
+        setNeedsProfileSetup(true);
+      } else {
+        setCurrentUser(null);
+        setIsJoined(false);
+        setNeedsProfileSetup(false);
       }
       setIsAuthReady(true);
     });
@@ -194,7 +248,7 @@ export default function App() {
 
   // Listen to all users (online and offline)
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser || !currentUser.id) return;
     
     const isCurrentUserGuest = currentUser.id.startsWith('guest_');
 
@@ -202,7 +256,7 @@ export default function App() {
       const allUsers: User[] = [];
       snap.forEach((childSnap) => {
         const u = childSnap.val() as User;
-        if (u.id !== currentUser.id) {
+        if (u && u.id && u.id !== currentUser.id) {
           const isTargetGuest = u.id.startsWith('guest_');
           
           if (isCurrentUserGuest) {
@@ -254,6 +308,7 @@ export default function App() {
   // Listen to active chat messages (This automatically loads history!)
   useEffect(() => {
     if (!currentUser || !selectedUser) return;
+    setIsMessagesLoading(true);
     const chatId = [currentUser.id, selectedUser.id].sort().join('_');
     const q = query(ref(db, 'messages'), orderByChild('chatId'), equalTo(chatId));
     const unsub = onValue(q, (snap) => {
@@ -272,6 +327,7 @@ export default function App() {
       
       msgs.sort((a, b) => a.timestamp - b.timestamp);
       setMessages(msgs);
+      setIsMessagesLoading(false);
 
       if (Object.keys(updates).length > 0) {
         update(ref(db, 'messages'), updates);
@@ -317,6 +373,42 @@ export default function App() {
     }
   };
 
+  const handleCompleteProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser || !setupName.trim()) return;
+
+    try {
+      const userRef = ref(db, `users/${currentUser.id}`);
+
+      // Setup disconnect hook so they go offline if they close the tab
+      onDisconnect(userRef).update({ 
+        isOnline: false, 
+        lastSeen: serverTimestamp() 
+      });
+
+      // Update user profile in DB
+      await update(userRef, {
+        id: currentUser.id,
+        name: setupName.trim(),
+        photoURL: setupPhotoURL.trim(),
+        isOnline: true,
+        lastSeen: serverTimestamp()
+      });
+
+      setCurrentUser({
+        id: currentUser.id,
+        name: setupName.trim(),
+        photoURL: setupPhotoURL.trim()
+      });
+
+      setNeedsProfileSetup(false);
+      setIsJoined(true);
+    } catch (error: any) {
+      console.error("Error saving profile:", error);
+      alert("Failed to save profile. " + error.message);
+    }
+  };
+
   const handleGuestJoin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (guestName.trim()) {
@@ -357,6 +449,9 @@ export default function App() {
   const selectUser = (user: User) => {
     setSelectedUser(user);
     setMessages([]); // Clear while loading
+    setIsMessagesLoading(true);
+    setReplyingTo(null);
+    setActiveReactionMsg(null);
   };
 
   const handleLogout = async () => {
@@ -376,7 +471,7 @@ export default function App() {
     setUnreadCounts({});
   };
 
-  const handleSendMessage = async (text: string) => {
+  const handleSendMessage = async (text: string, replyToMsg?: Message | null) => {
     if (!currentUser || !selectedUser) return;
     try {
       const chatId = [currentUser.id, selectedUser.id].sort().join('_');
@@ -389,12 +484,35 @@ export default function App() {
         receiverId: selectedUser.id,
         text,
         timestamp: Date.now(),
-        status: 'sent'
+        status: 'sent',
+        ...(replyToMsg && {
+          replyTo: {
+            id: replyToMsg.id,
+            text: replyToMsg.text,
+            senderName: replyToMsg.senderName
+          }
+        })
       };
       await set(newMsgRef, newMessage);
+      setReplyingTo(null);
     } catch (error: any) {
       console.error("Error sending message:", error);
       alert("Failed to send message. Check your Realtime Database Security Rules.");
+    }
+  };
+
+  const handleReaction = async (msgId: string, emoji: string) => {
+    if (!currentUser) return;
+    try {
+      const reactionRef = ref(db, `messages/${msgId}/reactions/${currentUser.id}`);
+      const msg = messages.find(m => m.id === msgId);
+      if (msg?.reactions?.[currentUser.id] === emoji) {
+        await set(reactionRef, null); // toggle off
+      } else {
+        await set(reactionRef, emoji);
+      }
+    } catch (error) {
+      console.error("Error setting reaction:", error);
     }
   };
 
@@ -406,9 +524,81 @@ export default function App() {
     );
   }
 
+  if (needsProfileSetup) {
+    return (
+      <div className="min-h-[100dvh] flex items-center justify-center p-4 relative">
+        <div className="absolute top-6 right-6">
+          <button 
+            onClick={() => setIsDarkMode(!isDarkMode)}
+            className="w-10 h-10 neu-flat hover:neu-convex active:neu-pressed rounded-full flex items-center justify-center text-neu-text transition-all"
+          >
+            {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+          </button>
+        </div>
+        <div className="neu-flat rounded-3xl p-6 md:p-8 w-full max-w-md flex flex-col items-center">
+          <div className="neu-convex w-24 h-24 rounded-full flex items-center justify-center mb-8 text-neu-accent overflow-hidden">
+            {setupPhotoURL ? (
+              <img src={setupPhotoURL} alt="Profile" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+            ) : (
+              <UserIcon size={40} />
+            )}
+          </div>
+          <h1 className="text-2xl font-bold mb-2 text-neu-text">Complete Profile</h1>
+          <p className="text-sm opacity-70 mb-8 text-center">Customize how others see you in the chat.</p>
+
+          <form onSubmit={handleCompleteProfile} className="w-full flex flex-col gap-4">
+            <div className="relative">
+              <div className="absolute inset-y-0 left-4 flex items-center pointer-events-none text-neu-text opacity-50">
+                <UserIcon size={20} />
+              </div>
+              <input
+                type="text"
+                value={setupName}
+                onChange={(e) => setSetupName(e.target.value)}
+                dir="auto"
+                placeholder="Your Name"
+                className="w-full neu-pressed rounded-2xl py-4 pl-12 pr-4 outline-none text-neu-text placeholder:text-neu-text/50 focus:ring-2 focus:ring-neu-accent/30 transition-all"
+                required
+                maxLength={30}
+              />
+            </div>
+            <div className="relative">
+              <div className="absolute inset-y-0 left-4 flex items-center pointer-events-none text-neu-text opacity-50">
+                <ImageIcon size={20} />
+              </div>
+              <input
+                type="url"
+                value={setupPhotoURL}
+                onChange={(e) => setSetupPhotoURL(e.target.value)}
+                dir="auto"
+                placeholder="Profile Picture URL (Optional)"
+                className="w-full neu-pressed rounded-2xl py-4 pl-12 pr-4 outline-none text-neu-text placeholder:text-neu-text/50 focus:ring-2 focus:ring-neu-accent/30 transition-all"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={!setupName.trim()}
+              className="w-full mt-4 neu-flat hover:neu-convex active:neu-pressed rounded-2xl py-4 font-semibold text-neu-accent transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Join Chat
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   if (!isJoined) {
     return (
-      <div className="min-h-[100dvh] flex items-center justify-center p-4">
+      <div className="min-h-[100dvh] flex items-center justify-center p-4 relative">
+        <div className="absolute top-6 right-6">
+          <button 
+            onClick={() => setIsDarkMode(!isDarkMode)}
+            className="w-10 h-10 neu-flat hover:neu-convex active:neu-pressed rounded-full flex items-center justify-center text-neu-text transition-all"
+          >
+            {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+          </button>
+        </div>
         <div className="neu-flat rounded-3xl p-6 md:p-8 w-full max-w-md flex flex-col items-center">
           <div className="neu-convex w-24 h-24 rounded-full flex items-center justify-center mb-8 text-neu-accent">
             <MessageSquare size={40} />
@@ -501,6 +691,13 @@ export default function App() {
               <Users size={24} className="text-neu-accent" />
               Contacts
             </h2>
+            <button 
+              onClick={() => setIsDarkMode(!isDarkMode)}
+              className="w-10 h-10 neu-flat hover:neu-convex active:neu-pressed rounded-full flex items-center justify-center text-neu-text transition-all"
+              title="Toggle Dark Mode"
+            >
+              {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+            </button>
           </div>
           
           <div className="flex-1 overflow-y-auto pr-2 space-y-4 custom-scrollbar">
@@ -575,7 +772,15 @@ export default function App() {
           !selectedUser ? "hidden md:flex" : "flex"
         )}>
           {!selectedUser ? (
-            <div className="flex-1 flex flex-col items-center justify-center opacity-50 p-8 text-center">
+            <div className="flex-1 flex flex-col items-center justify-center opacity-50 p-8 text-center relative">
+              <div className="absolute top-6 right-6 md:hidden">
+                <button 
+                  onClick={() => setIsDarkMode(!isDarkMode)}
+                  className="w-10 h-10 neu-flat hover:neu-convex active:neu-pressed rounded-full flex items-center justify-center text-neu-text transition-all"
+                >
+                  {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+                </button>
+              </div>
               <MessageSquare size={64} className="mb-6 text-neu-accent opacity-50" />
               <h2 className="text-2xl font-bold mb-2">Welcome, {currentUser?.name}!</h2>
               <p>Select a contact from the sidebar to start a private conversation.</p>
@@ -605,11 +810,34 @@ export default function App() {
                     <p className="text-xs opacity-50 font-medium">Offline</p>
                   )}
                 </div>
+                <div className="md:hidden">
+                  <button 
+                    onClick={() => setIsDarkMode(!isDarkMode)}
+                    className="w-10 h-10 neu-flat hover:neu-convex active:neu-pressed rounded-full flex items-center justify-center text-neu-text transition-all"
+                  >
+                    {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+                  </button>
+                </div>
               </div>
 
               {/* Messages Area */}
               <div className="flex-1 p-4 md:p-6 overflow-y-auto custom-scrollbar flex flex-col gap-4 md:gap-6">
-                {messages.length === 0 ? (
+                {isMessagesLoading ? (
+                  <div className="flex-1 flex flex-col gap-4 md:gap-6 opacity-60">
+                    <div className="self-start flex flex-col gap-1 w-2/3 max-w-[250px]">
+                      <div className="w-16 h-3 bg-neu-text/20 rounded animate-pulse mb-1"></div>
+                      <div className="w-full h-12 neu-flat rounded-2xl rounded-bl-sm animate-pulse"></div>
+                    </div>
+                    <div className="self-end flex flex-col items-end gap-1 w-1/2 max-w-[200px]">
+                      <div className="w-16 h-3 bg-neu-text/20 rounded animate-pulse mb-1"></div>
+                      <div className="w-full h-10 neu-flat rounded-2xl rounded-br-sm animate-pulse"></div>
+                    </div>
+                    <div className="self-start flex flex-col gap-1 w-3/4 max-w-[300px]">
+                      <div className="w-16 h-3 bg-neu-text/20 rounded animate-pulse mb-1"></div>
+                      <div className="w-full h-16 neu-flat rounded-2xl rounded-bl-sm animate-pulse"></div>
+                    </div>
+                  </div>
+                ) : messages.length === 0 ? (
                   <div className="flex-1 flex flex-col items-center justify-center opacity-50">
                     <p>No messages yet. Say hi to {selectedUser.name}!</p>
                   </div>
@@ -617,6 +845,8 @@ export default function App() {
                   <AnimatePresence initial={false}>
                     {messages.map((msg) => {
                       const isMe = msg.senderId === currentUser?.id;
+                      const reactionEntries = msg.reactions ? Object.entries(msg.reactions) : [];
+                      
                       return (
                         <motion.div
                           key={msg.id}
@@ -624,24 +854,81 @@ export default function App() {
                           animate={{ opacity: 1, y: 0, scale: 1 }}
                           transition={{ duration: 0.2 }}
                           className={cn(
-                            "flex flex-col max-w-[80%]",
-                            isMe ? "self-end items-end" : "self-start items-start"
+                            "flex w-full group gap-2 items-end",
+                            isMe ? "justify-end" : "justify-start"
                           )}
                         >
-                          <span className="text-[10px] md:text-xs opacity-60 mb-1 px-2 flex items-center gap-1 font-medium">
-                            {format(new Date(msg.timestamp), 'h:mm a')}
-                            {isMe && <MessageStatusIndicator status={msg.status || 'sent'} />}
-                          </span>
-                          <div
-                            className={cn(
-                              "px-4 py-2 md:px-5 md:py-3 rounded-2xl text-sm md:text-base transition-all duration-300",
-                              isMe 
-                                ? "neu-bubble-sent text-neu-text rounded-br-sm" 
-                                : "neu-bubble-received text-neu-text rounded-bl-sm"
-                            )}
-                          >
-                            <p className="break-words leading-relaxed" dir="auto">{msg.text}</p>
+                          {/* Actions for My Messages (Left side) */}
+                          {isMe && (
+                            <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity mb-2 relative">
+                              <button onClick={() => setActiveReactionMsg(activeReactionMsg === msg.id ? null : msg.id)} className="p-1.5 rounded-full neu-flat hover:neu-convex text-neu-text/70 transition-all"><Smile size={14}/></button>
+                              <button onClick={() => setReplyingTo(msg)} className="p-1.5 rounded-full neu-flat hover:neu-convex text-neu-text/70 transition-all"><Reply size={14}/></button>
+                              
+                              {activeReactionMsg === msg.id && (
+                                <div className="absolute bottom-full right-0 mb-2 z-10 flex gap-1 p-2 neu-flat rounded-2xl">
+                                  {['👍', '❤️', '😂', '😮', '😢'].map(e => (
+                                    <button key={e} onClick={() => { handleReaction(msg.id, e); setActiveReactionMsg(null); }} className="hover:scale-125 transition-transform text-lg">{e}</button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          <div className={cn(
+                            "flex flex-col max-w-[75%]",
+                            isMe ? "items-end" : "items-start"
+                          )}>
+                            <span className="text-[10px] md:text-xs opacity-60 mb-1 px-2 flex items-center gap-1 font-medium">
+                              {format(new Date(msg.timestamp), 'h:mm a')}
+                              {isMe && <MessageStatusIndicator status={msg.status || 'sent'} />}
+                            </span>
+                            <div
+                              className={cn(
+                                "px-4 py-2 md:px-5 md:py-3 rounded-2xl text-sm md:text-base transition-all duration-300 relative",
+                                isMe 
+                                  ? "neu-bubble-sent text-neu-text rounded-br-sm" 
+                                  : "neu-bubble-received text-neu-text rounded-bl-sm"
+                              )}
+                            >
+                              {msg.replyTo && (
+                                <div className="mb-2 p-2 rounded-lg bg-black/5 dark:bg-white/5 border-l-2 border-neu-accent text-xs opacity-80">
+                                  <span className="font-bold block mb-0.5">{msg.replyTo.senderName}</span>
+                                  <span className="truncate block max-w-full">{msg.replyTo.text}</span>
+                                </div>
+                              )}
+                              <p className="break-words leading-relaxed" dir="auto">{msg.text}</p>
+                              
+                              {/* Reactions Badge */}
+                              {reactionEntries.length > 0 && (
+                                <div className={cn(
+                                  "absolute -bottom-3 flex gap-1 p-1 rounded-full neu-flat bg-opacity-90 shadow-sm",
+                                  isMe ? "right-4" : "left-4"
+                                )}>
+                                  {reactionEntries.map(([userId, emoji]) => (
+                                    <span key={userId} className="text-xs" title={userId === currentUser?.id ? 'You' : selectedUser?.name}>
+                                      {emoji}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
                           </div>
+
+                          {/* Actions for Received Messages (Right side) */}
+                          {!isMe && (
+                            <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity mb-2 relative">
+                              <button onClick={() => setReplyingTo(msg)} className="p-1.5 rounded-full neu-flat hover:neu-convex text-neu-text/70 transition-all"><Reply size={14}/></button>
+                              <button onClick={() => setActiveReactionMsg(activeReactionMsg === msg.id ? null : msg.id)} className="p-1.5 rounded-full neu-flat hover:neu-convex text-neu-text/70 transition-all"><Smile size={14}/></button>
+                              
+                              {activeReactionMsg === msg.id && (
+                                <div className="absolute bottom-full left-0 mb-2 z-10 flex gap-1 p-2 neu-flat rounded-2xl">
+                                  {['👍', '❤️', '😂', '😮', '😢'].map(e => (
+                                    <button key={e} onClick={() => { handleReaction(msg.id, e); setActiveReactionMsg(null); }} className="hover:scale-125 transition-transform text-lg">{e}</button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </motion.div>
                       );
                     })}
@@ -668,7 +955,9 @@ export default function App() {
                 <ChatInput 
                   currentUser={currentUser!}
                   selectedUser={selectedUser} 
-                  onSendMessage={handleSendMessage} 
+                  onSendMessage={handleSendMessage}
+                  replyingTo={replyingTo}
+                  onCancelReply={() => setReplyingTo(null)}
                 />
               </div>
             </>
